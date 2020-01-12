@@ -1,4 +1,9 @@
 -------------------------------------------------------------------
+Sun Jan 12 15:16:11 UTC 2020 - Michal Suchanek <msuchanek@suse.com>
+
+- Stub that can execute command through sockserver.
+
+-------------------------------------------------------------------
 Wed Jan  8 20:47:49 UTC 2020 - Michal Suchanek <msuchanek@suse.com>
 
 - Stub that can run lpar_netboot to pinging server which fails.
