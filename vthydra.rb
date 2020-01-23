@@ -1,5 +1,7 @@
 #!/usr/bin/ruby
 
+# vim:set shiftwidth=2 expandtab:
+
 require 'socket'
 
 SOCK = "/tmp/vthydrasock"
@@ -8,15 +10,22 @@ LOG = "/tmp/vthydra.log"
 IOTYPES = %w(in out err)
 IOS = [STDIN,STDOUT,STDERR]
 
+class Array
+  def mapm method, *args
+    self.map{|elt| elt.send method, *args}
+  end
+end
+
 class VTHydraException < Exception
 end
 
-def handle_exception e
+def handle_exception e, description=nil
   raise if e.is_a? SystemExit
+  description = (description ? description + ": " : "")
   if e.kind_of? VTHydraException or e.kind_of? Interrupt or e.kind_of? SignalException then
-    STDERR.puts e.message
+    STDERR.puts description + e.message
   else
-    STDERR.puts e.full_message.gsub(/`/,"'")
+    STDERR.puts description + e.full_message.gsub(/`/,"'")
   end
 end
 
@@ -66,13 +75,13 @@ end
 
 class IODesc
   BLOCKSIZE = 4096
-  def initialize io, desc, close_done=false
+  def initialize io, desc, close_finnished=false
     @io = io
     @desc = desc
-    @close_done = close_done
+    @close_finnished = close_finnished
   end
 
-  attr_accessor :desc, :close_done, :io
+  attr_accessor :desc, :close_finnished, :io
 
   def stream_to other
     other.stream_from self
@@ -83,36 +92,39 @@ class IODesc
   end
 
   def cleanup
-    return unless @close_done
+    return unless @close_finnished
     STDERR.puts "Cleaning up io #@desc (#{fileno})"
     @io.close
   end
 
   def stream_from other
     begin
-      STDERR.puts "Starting iothread #{other.desc} (#{other.fileno}) -> #@desc (#{fileno})"
+      stream_desc = "#{other.desc} (#{other.fileno}) -> #@desc (#{fileno})"
+      STDERR.puts "Starting iothread " + stream_desc
       buffer = []
       readerr = nil
       while true do
         begin
-          r, w, e = IO.select [other.io], buffer.length ? [@io] : [] , [other.io,@io]
+          r, w, e = IO.select [other.io], (buffer[0] ? [@io] : []) , [other.io,@io], 1
+          STDERR.puts "Select #{stream_desc} b:#{buffer.inspect} r:#{r.inspect} w:#{w.inspect} e:#{e.inspect}"
         rescue Errno::EBADF
           fd = @io.fileno rescue nil
           raise HydraPipeError.new "#{desc}: #{$!.message}" if ! fd
           readerr = $!
         end
         begin
-          if r[0] then
+          if r && r[0] then
             data = r[0].read_nonblock BLOCKSIZE
             if data then
               STDERR.puts "Read from #{other.desc} (#{other.fileno}) '#{data}'"
               buffer.push data
             end
           end
-        rescue Errno::ECONNRESET, EOFError, IOError, Errno::EPIPE
+        rescue Errno::ECONNRESET, EOFError, IOError, Errno::EPIPE, Errno::EBADF
           readerr = $!
         end
         begin
+          @io.write ""
           while buffer[0] do
             data = buffer.shift
             written = @io.write_nonblock data
@@ -123,13 +135,13 @@ class IODesc
             end
             break if ! buffer[0]
           end
-        rescue Errno::ECONNRESET, EOFError, IOError, Errno::EPIPE
+        rescue Errno::ECONNRESET, EOFError, IOError, Errno::EPIPE, Errno::EBADF
           raise HydraPipeError.new "#{desc}: #{$!.message}"
         end
         raise HydraPipeError.new "#{other.desc}: #{readerr.message}" if readerr
       end
     ensure
-      STDERR.puts "Closing iothread #{other.desc} (#{other.fileno}) -> #@desc (#{fileno})"
+      STDERR.puts "Closing iothread " + stream_desc
       other.cleanup
       cleanup
     end
@@ -137,179 +149,243 @@ class IODesc
 end
 
 class VTHServer
-
-  def readargs io
-    args = io.gets("\0\0").split(/\0/)
-  end
-
-  def start_server machine, lpar
-    cmd = %w(mkvterm -m)
-    cmd.push machine
-    cmd.push "-p"
-    cmd.push lpar
-    cmd = get_cmd *cmd
-    spawn_cmd *cmd
-  end
-
-  def spawn_cmd *cmd
+  attr_accessor :persistent
+  attr_reader :pid, :cmd
+  def initialize *cmd
+    @cmd = cmd
+    @clients = []
     STDERR.puts "Starting server thread #{cmd.inspect}"
-    stdin, inpipe = IO.pipe
-    outpipe, stdout= IO.pipe
-    errpipe, stderr= IO.pipe
-    STDERR.puts "IN: #{inpipe.fileno}:#{stdin.fileno} OUT: #{outpipe.fileno}:#{stdout.fileno} ERR: #{errpipe.fileno}:#{stderr.fileno}"
-    [ inpipe, stdin, stdout, outpipe, stderr, errpipe].each{|fd| fd.sync = true}
-    pid = spawn(*cmd, :err=>stderr, :out=>stdout, :in=>stdin, :close_others=>true)
-    STDERR.puts "Started server thread #{cmd.inspect} #{pid}"
-    addfds inpipe, outpipe, errpipe
-    [stdin, stdout, stderr].each{|fd| fd.close}
-    server = [pid, inpipe.fileno, outpipe.fileno, errpipe.fileno]
+    @stdin, @inpipe = IO.pipe
+    @outpipe, @stdout= IO.pipe
+    @errpipe, @stderr= IO.pipe
+    STDERR.puts "IN: #{@inpipe.fileno}:#{@stdin.fileno} OUT: #{@outpipe.fileno}:#{@stdout.fileno} ERR: #{@errpipe.fileno}:#{@stderr.fileno}"
+    [ @inpipe, @stdin, @stdout, @outpipe, @stderr, @errpipe].each{|fd| fd.sync = true}
+    @persistent = false
+    @status = false
+    @status_mutex = Mutex.new
   end
-
-  def get_server machine, lpar
-    key = "#{machine}\0#{lpar}"
-    server = @servers[key]
+  def run
+    return if !@cmd || @cmd.length == 0
+    STDERR.puts "Starting server thread #{@cmd.inspect}"
     begin
-      server[1..-1].each{|fd| IO.for_fd fd} if server
-    rescue
-      remove_server server
-      server = nil
+    @pid = spawn(*@cmd, :err=>@stderr, :out=>@stdout, :in=>@stdin, :close_others=>true)
+    [@stdin, @stdout, @stderr].each{|fd| fd.close}
+    Thread.new{
+      begin
+        wait
+      rescue Object
+        handle_exception $!
+      end
+    }
+    STDERR.puts "Started server thread #{@cmd.inspect} #{@pid.inspect}"
+    rescue Object
+      begin
+      @stderr.puts $!.message.gsub(/`/,"'")
+      rescue Object
+        handle_exception $!, "Reporting spawn error to client"
+      end
+      @cmd = nil
+      handle_exception $!
+      cleanup
     end
-    return server if server
-    return @servers[key] = (start_server machine, lpar)
   end
-
-  def addfds *fds
-    fds.each{|fd| @fd[fd.fileno] = fd}
+  def fds
+    [@inpipe, @outpipe, @errpipe].mapm :to_i
   end
-
-  def removefds *fds
-    fds.each{|fd| @fd.delete fd}
+  def puts *args
+    @stdout.puts *args
   end
-
-  def remove_server server
-    removefds *server[1..-1]
-    @servers.delete_if{|k,s| s == server} if server
+  def running
+    !@finished
   end
+  def add_client cli
+    @clients << cli
+  end
+  def remove_client cli
+    @clients.delete cli
+    cleanup unless @clients.length
+  end
+  def cleanup
+    return if @persistent && !@finished
+    [ @stdin, @stdout, @stderr].each{|fd| fd.close rescue nil} unless @cmd && @cmd.length
+  end
+  def wait
+    @status_mutex.synchronize {
+      return @status if @status
+      _, @status = Process.wait @pid rescue nil
+      #@inpipe.close rescue nil
+      @finished = true
+      @status
+    }
+  end
+end
 
-  def client_sock type, io, main_io, fd
+class VTHClientConnection
+  @@servers = {}
+  @@clients = {}
+
+  def readargs
     begin
-      STDERR.puts "#{io.fileno}: #{IOTYPES[type]}sock IO thread starting (#{main_io}, #{fd})"
-      main_io = main_io.to_i
-      fd = fd.to_i
-      if fd != 0 then
-        pipe = IO.for_fd fd rescue nil
-        pipedesc = "pipe:#{fd}"
-        if pipe then
-          pipe = IODesc.new pipe, pipedesc
+      args = @io.gets("\0\0").split(/\0/)
+    rescue Object
+      handle_exception $!
+      nil
+    end
+  end
+
+  def initialize io
+    @io = io
+    args = readargs
+    if not args then
+      STDERR.puts "#{@io.fileno}: did not get arguments, closing."
+      @io.close
+    end
+    STDERR.puts "#{@io.fileno}: got arguments #{args.inspect}"
+    @command, *@args = args
+    if @command =~ /^(in|out|err)sock$/ then
+      @command.sub!(/sock$/,'')
+      return sock
+    end
+    @@clients[@io.fileno] = []
+    return mkvterm if @command =~ /^mkvterm$/
+    return do_spawn if @command =~ /^spawn$/
+    @args = args
+    return servercmd
+  end
+
+  def sock
+    begin
+      @type =  IOTYPES.find_index(@command)
+      @main_io, @fd = @args.mapm :to_i
+      STDERR.puts "#{@io.fileno}: #{IOTYPES[@type]}sock IO thread starting (#{@main_io}, #{@fd})"
+      if @fd != 0 then
+        @pipe = IO.for_fd @fd rescue nil
+        pipedesc = "pipe:#{@fd}"
+        if @pipe then
+          @pipe = IODesc.new @pipe, pipedesc
         else
           raise HydraPipeError.new "#{pipedesc}: Bad file descriptor"
         end
       end
     end
-    @clients[main_io] = [] if ! @clients[main_io]
-    @clients[main_io][type] = io
-    io.write("\0");
-    desc = IODesc.new io, "#{IOTYPES[type]}sock (#{main_io}, #{fd})"
-    if type > 0 then
-      desc.stream_from pipe
+    @@clients[@main_io][@type] = @io
+    @io.write("\0");
+    @desc = IODesc.new @io, "#{IOTYPES[@type]}sock (#{@main_io}, #{@fd})"
+    if @type > 0 then
+      @desc.stream_from @pipe
     else
-      desc.stream_to pipe
+      @desc.stream_to @pipe
     end
   ensure
-    if fd !=0 then
-      STDERR.puts "#{io.fileno}: #{IOTYPES[type]}sock IO thread stopping (#{main_io}, #{fd})"
-      io.close
+    if @fd !=0 then
+      STDERR.puts "#{@io.fileno}: #{IOTYPES[@type]}sock IO thread stopping (#{@main_io}, #{@fd})"
+      @io.close rescue nil
     end
   end
 
-  def insock io, main_io, fd
-    client_sock 0, io, main_io, fd
+  def start_server
+    cmd = %w(mkvterm -m)
+    cmd.push @machine
+    cmd.push "-p"
+    cmd.push @lpar
+    cmd = get_cmd *cmd
+    @server = VTHServer.new *cmd
+    @server.persistent = true
+    @server
   end
 
-  def outsock io, main_io, fd
-    client_sock 1, io, main_io, fd
+  def get_server
+    @key = "#{@machine}\0#{@lpar}"
+    @server = @@servers[@key]
+    if ! @server.pid then
+      remove_server @server
+      @server = nil
+    end
+    return @server if @server
+    return @@servers[@key] = start_server
   end
 
-  def errsock io, main_io, fd
-    client_sock 2, io, main_io, fd
+  def remove_server server
+    @@servers.delete_if{|k,s| s == server} if server
   end
 
-  def end_client io
-    clients.each{|c|c.each{|io|io.close rescue nil}}
+  def end_client
+    @@clients[@io.fileno].each{|s| s.close rescue nil }
+    @io.close
   end
 
-  def servercmd io, *args
-    connectsocks io, [0]*4
-    args.each{|a|
+  def servercmd
+    @server = VTHServer.new
+    connectsocks
+    @args.each{|a|
       case a
       when /^Kill!$/
         STDERR.puts "Killing server."
-        @clients[io.fileno][1].puts "Killing server."
+        @server.puts "Killing server."
+        @io.write "0\0"
         exit 0
       else
-        STDERR.puts "#{io.fileno}: Unknown command"
-        @clients[io.fileno][1].puts "Unknown command."
+        STDERR.puts "#{@io.fileno}: Unknown command"
+        @server.puts "Unknown command."
+        @io.write "255\0"
       end
     }
-    io.close
-    end_client io
+    @server.cleanup
+    end_client
   end
 
-  def do_spawn io, *args
-    STDERR.puts "#{io.fileno}: Starting server for #{args.inspect}"
-    server = spawn_cmd *args
-    STDERR.puts "#{io.fileno}: Started server #{server.inspect}"
-    connectsocks io, server
-    waitserver io, server
+  def do_spawn
+    STDERR.puts "#{@io.fileno}: Starting server for #{@args.inspect}"
+    @server = VTHServer.new *@args
+    STDERR.puts "#{@io.fileno}: Set up server #{@server.inspect}"
+    connectsocks
+    waitserver
   end
 
-  def mkvterm io, *args
-    STDERR.puts "#{io.fileno}: Getting server connection for #{args.inspect}"
-    *machine = find_machine_arg *args
-    STDERR.puts "#{io.fileno}: Found machine #{machine.inspect}"
-    server = get_server *machine
-    STDERR.puts "#{io.fileno}: Found server #{server.inspect}"
-    connectsocks io, server
-    waitserver io, server
+  def mkvterm
+    STDERR.puts "#{@io.fileno}: Getting server connection for #{@args.inspect}"
+    @machine, @lpar = find_machine_arg *@args
+    STDERR.puts "#{@io.fileno}: Found machine #{machine.inspect}"
+    @server = get_server
+    STDERR.puts "#{@io.fileno}: Found server #{@server.inspect}"
+    connectsocks
+    waitserver
   end
 
-  def connectsocks io, server
-    io.write "#{io.fileno}\0"
-    io.write "#{server[1..3].join("\0")}\0"
-    io.getc
+  def connectsocks
+    @io.write "#{@io.fileno}\0"
+    @io.write "#{@server.fds.join("\0")}\0"
+    @io.getc
+    @io.getc
+    @io.getc
+    @io.getc
   end
-  def waitserver io, server
+
+  def waitserver
     begin
-      STDERR.puts "#{io.fileno}: Waiting for #{server[0]}"
-      _, status = Process.wait server[0]
-      io.write "#{status}\0"
-      STDERR.puts "#{io.fileno}: #{server[0]} exited, cleaning up"
+      STDERR.puts "#{@io.fileno}: Starting server #{@server.cmd.inspect}"
+      @server.run
+      STDERR.puts "#{@io.fileno}: Waiting for #{@server.pid}"
+      status = @server.wait
+      @io.write "#{status}\0"
     ensure
-      server[1..-1].each{|fileno| IO.for_fd(fileno).close rescue nil} if server
-      remove_server server
-      STDERR.puts "#{io.fileno}: Terminating"
-      io.close
+      STDERR.puts "#{@io.fileno}: #{@server.pid} exited, cleaning up"
+      @server.cleanup
+      remove_server @server unless @server.running
+      STDERR.puts "#{@io.fileno}: Terminating"
+      @io.close
     end
   end
+
+end
+
+class VTHServerDispatcher
 
   def serve io
     begin
       STDERR.puts "#{io.fileno}: New thread starting"
       io.sync = true
-      args = readargs io rescue nil
-      if not args then
-        STDERR.puts "#{io.fileno}: did not get arguments, closing."
-        io.close
-        return 0
-      end
-      STDERR.puts "#{io.fileno}: got arguments #{args.inspect}"
-      command, *args = args
-      return insock io, *args if command =~ /^insock$/
-      return outsock io, *args if command =~ /^outsock$/
-      return errsock io, *args if command =~ /^errsock$/
-      return mkvterm io, *args if command =~ /^mkvterm$/
-      return do_spawn io, *args if command =~ /^spawn$/
-      return servercmd io, command, *args
+      VTHClientConnection.new io
     rescue Object
       handle_exception $!
     end
@@ -323,14 +399,11 @@ class VTHServer
     $stdout.reopen(LOG,"at")
     $stdout.sync = true
     STDERR.puts "Starting daemon"
-    @servers={}
-    @clients={}
-    @fd={}
     sock = Socket.unix_server_socket(SOCK)
     sock.listen 10
     while conn = sock.accept do
       io, address = conn
-      STDERR.puts "#{io.fileno}: Accepted connection from '#{address}'"
+      STDERR.puts "#{io.fileno}: Accepted connection from '#{address.inspect}'"
       Thread.new(io){|io| serve io }
     end
     exit 0
@@ -355,13 +428,14 @@ class VTHClient
 
   def connectsock
     sock = newsock
+    @connected = true
     sock.write @args.join("\0")+"\0\0"
     @cli_key = readint sock
     @sock_keys = (0..2).map{readint sock}
     @sock = sock
   end
 
-  def cli_thread type, key
+  def io_thread type, key
     sock = newsock
     sock.write "#{IOTYPES[type]}sock\0#@cli_key\0#{key}\0\0"
     sock.getc
@@ -374,17 +448,19 @@ class VTHClient
       sock.close_read
       method = :stream_to
     end
-    Thread.new {
+    t = Thread.new {
       begin
         stdio.send method, desc
       rescue Object
         handle_exception $!
       end
     }
+    @sock.write("\0")
+    t
   end
 
   def passthru
-    threads=@sock_keys.to_enum(:each_with_index).map{|key,i| cli_thread i, key}
+    threads=@sock_keys.to_enum(:each_with_index).map{|key,i| io_thread i, key}
     @sock.write("\0")
     threads.reverse.each{|t|t.join}
   end
@@ -394,10 +470,10 @@ class VTHClient
     begin
       connectsock
     rescue
-      STDERR.puts "Connecting to server failed, trying to for one"
-      if not fork then
+      STDERR.puts "Connecting to server failed, trying to fork one"
+      if ! @connected then if not fork then
         STDERR.puts "Forked daemon"
-        VTHServer.new
+        VTHServerDispatcher.new
       else
         STDERR << "Waiting for sockserver to start"
         (1..3).each{
@@ -408,10 +484,16 @@ class VTHClient
         }
         STDERR << "\n"
       end
+      end
     end
     raise HydraConnectError.new  unless @sock
     passthru
-    exit readint
+    begin
+      exit readint
+    rescue Object
+      handle_exception $!
+      exit -Errno::EPIPE::Errno
+    end
   end
 end
 
