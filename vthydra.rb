@@ -16,6 +16,96 @@ class Array
   end
 end
 
+class IO
+  module Poll
+    arch, os = RUBY_PLATFORM.split('-')
+    case os
+    when /^linux$/
+=begin /usr/include/sys/poll.h
+typedef unsigned long int nfds_t;
+struct pollfd
+  {
+    int fd;                     /* File descriptor to poll.  */
+    short int events;           /* Types of events poller cares about.  */
+    short int revents;          /* Types of events that actually occurred.  */
+  };
+extern int poll (struct pollfd *__fds, nfds_t __nfds, int __timeout);
+=end
+      require 'ffi'
+      extend FFI::Library
+      ffi_lib FFI::Library::LIBC
+
+      class StructPollfd < FFI::Struct
+        layout :fd, :int,
+          :events, :short,
+          :revents, :short
+      end
+      attach_function 'poll', [:pointer, :int, :int], :int
+
+=begin /usr/include/bits/poll.h
+=end
+      POLLIN            = 0x0001        # There is data to read.
+      POLLPRI           = 0x0002        # There is urgent data to read.
+      POLLOUT           = 0x0004        # Writing now will not block.
+
+      # XOPEN
+      POLLRDNORM        = 0x0042        # Normal data may be read.
+      POLLRDBAND        = 0x0080        # Priority data may be read.
+      POLLWRNORM        = 0x0100        # Writing now will not block.
+      POLLWRBAND        = 0x0200        # Priority data may be written.
+
+      # GNU
+      POLLMSG           = 0x0400
+      POLLREMOVE        = 0x1000
+      POLLRDHUP         = 0x2000
+
+      # in revents only
+      POLLERR           = 0x0008        # Error condition.
+      POLLHUP           = 0x0010        # Hung up.
+      POLLNVAL          = 0x0020        # Invalid polling request.
+
+    else
+      raise "Platform #{RUBY_PLATFORM} not supported. Please check your poll.h and add definitions."
+    end
+  end
+  def self.select_with_poll read, write=[], error=[], timeout=nil
+    fds={}
+    error.each{|fd| fds[fd.fileno] = 0}
+    write.each{|fd| fds[fd.fileno] = Poll::POLLOUT }
+    read.each{|fd| fds[fd.fileno] ? (fds[fd.fileno] |= Poll::POLLIN) : fds[fd.fileno] = Poll::POLLIN }
+    pollfds = FFI::MemoryPointer.new(Poll::StructPollfd, fds.length)
+    fds.keys.each_with_index{|fd, i|
+      struct = Poll::StructPollfd.new(pollfds[i])
+      struct[:fd] = fd
+      struct[:events] = fds[fd]
+    }
+    FFI::LastError::error = 0
+    rc = Poll.poll pollfds, fds.length, (timeout ? timeout * 1000 : -1)
+    if (rc < 0) then
+      err = FFI::LastError::error
+      Errno.constants.each{|c|
+        throw Errno.const_get c if (Errno.const_get c)::Errno == err
+      }
+      throw "poll: Unknown error #{err}."
+    else
+      e = []
+      r = []
+      w = []
+      fdsi = fds.keys.map.with_index.to_h{|fd, i| [i, fd]}
+      error.each{|fd|
+        e << fd if (Poll::StructPollfd.new(pollfds[fdsi[fd.fileno]])[:revents] & (Poll::POLLERR | Poll::POLLHUP | Poll::POLLNVAL)) != 0
+      }
+      write.each{|fd|
+        w << fd if (Poll::StructPollfd.new(pollfds[fdsi[fd.fileno]])[:revents] & Poll::POLLOUT ) != 0
+      }
+      read.each{|fd|
+        r << fd if (Poll::StructPollfd.new(pollfds[fdsi[fd.fileno]])[:revents] & Poll::POLLIN ) != 0
+      }
+      return [r, w, e]
+    end
+  end
+end
+
 class VTHydraException < Exception
 end
 
@@ -77,18 +167,16 @@ class IODesc
   BLOCKSIZE = 4096
   def initialize io, desc, close_finnished=false
     @io = io
+    @fileno = io.fileno
     @desc = desc
     @close_finnished = close_finnished
   end
 
-  attr_accessor :desc, :close_finnished, :io
+  attr_accessor :close_finnished
+  attr_accessor :desc, :io, :fileno
 
   def stream_to other
     other.stream_from self
-  end
-
-  def fileno
-    @io.fileno
   end
 
   def cleanup
@@ -105,13 +193,20 @@ class IODesc
       readerr = nil
       while true do
         begin
-          r, w, e = IO.select [other.io], (buffer[0] ? [@io] : []) , [other.io,@io], 1
+          r, w, e = IO.select_with_poll [other.io], (buffer[0] ? [@io] : []) , [other.io,@io], 1
           STDERR.puts "Select #{stream_desc} b:#{buffer.inspect} r:#{r.inspect} w:#{w.inspect} e:#{e.inspect}"
         rescue Errno::EBADF
           fd = @io.fileno rescue nil
           raise HydraPipeError.new "#{desc}: #{$!.message}" if ! fd
           readerr = $!
         end
+        e.each{|io|
+          if @io == io then
+            raise HydraPipeError.new "#{desc}: Poll error on descriptor"
+          else
+            raise HydraPipeError.new "#{other.desc}: Poll error on descriptor"
+          end
+        }
         begin
           if r && r[0] then
             data = r[0].read_nonblock BLOCKSIZE
@@ -168,19 +263,19 @@ class VTHServer
     return if !@cmd || @cmd.length == 0
     STDERR.puts "Starting server thread #{@cmd.inspect}"
     begin
-    @pid = spawn(*@cmd, :err=>@stderr, :out=>@stdout, :in=>@stdin, :close_others=>true)
-    [@stdin, @stdout, @stderr].each{|fd| fd.close}
-    Thread.new{
-      begin
-        wait
-      rescue Object
-        handle_exception $!
-      end
-    }
-    STDERR.puts "Started server thread #{@cmd.inspect} #{@pid.inspect}"
+      @pid = spawn(*@cmd, :err=>@stderr, :out=>@stdout, :in=>@stdin, :close_others=>true)
+      [@stdin, @stdout, @stderr].each{|fd| fd.close}
+      Thread.new{
+        begin
+          wait_cmd
+        rescue Object
+          handle_exception $!
+        end
+      }
+      STDERR.puts "Started server thread #{@cmd.inspect} #{@pid.inspect}"
     rescue Object
       begin
-      @stderr.puts $!.message.gsub(/`/,"'")
+        @stderr.puts $!.message.gsub(/`/,"'")
       rescue Object
         handle_exception $!, "Reporting spawn error to client"
       end
@@ -209,11 +304,11 @@ class VTHServer
     return if @persistent && !@finished
     [ @stdin, @stdout, @stderr].each{|fd| fd.close rescue nil} unless @cmd && @cmd.length
   end
-  def wait
+  def wait_cmd
     @status_mutex.synchronize {
       return @status if @status
-      _, @status = Process.wait @pid rescue nil
-      #@inpipe.close rescue nil
+      Process.waitpid @pid, 0 rescue nil
+      @status = $?
       @finished = true
       @status
     }
@@ -235,18 +330,19 @@ class VTHClientConnection
 
   def initialize io
     @io = io
+    @fileno = io.fileno
     args = readargs
     if not args then
-      STDERR.puts "#{@io.fileno}: did not get arguments, closing."
+      STDERR.puts "#{@fileno}: did not get arguments, closing."
       @io.close
     end
-    STDERR.puts "#{@io.fileno}: got arguments #{args.inspect}"
+    STDERR.puts "#{@fileno}: got arguments #{args.inspect}"
     @command, *@args = args
     if @command =~ /^(in|out|err)sock$/ then
       @command.sub!(/sock$/,'')
       return sock
     end
-    @@clients[@io.fileno] = []
+    @@clients[@fileno] = []
     return mkvterm if @command =~ /^mkvterm$/
     return do_spawn if @command =~ /^spawn$/
     @args = args
@@ -257,12 +353,12 @@ class VTHClientConnection
     begin
       @type =  IOTYPES.find_index(@command)
       @main_io, @fd = @args.mapm :to_i
-      STDERR.puts "#{@io.fileno}: #{IOTYPES[@type]}sock IO thread starting (#{@main_io}, #{@fd})"
+      STDERR.puts "#{@fileno}: #{IOTYPES[@type]}sock IO thread starting (#{@main_io}, #{@fd})"
       if @fd != 0 then
         @pipe = IO.for_fd @fd rescue nil
         pipedesc = "pipe:#{@fd}"
         if @pipe then
-          @pipe = IODesc.new @pipe, pipedesc
+          @pipe = IODesc.new @pipe, pipedesc, true
         else
           raise HydraPipeError.new "#{pipedesc}: Bad file descriptor"
         end
@@ -270,7 +366,7 @@ class VTHClientConnection
     end
     @@clients[@main_io][@type] = @io
     @io.write("\0");
-    @desc = IODesc.new @io, "#{IOTYPES[@type]}sock (#{@main_io}, #{@fd})"
+    @desc = IODesc.new @io, "#{IOTYPES[@type]}sock (#{@main_io}, #{@fd})", true
     if @type > 0 then
       @desc.stream_from @pipe
     else
@@ -278,7 +374,7 @@ class VTHClientConnection
     end
   ensure
     if @fd !=0 then
-      STDERR.puts "#{@io.fileno}: #{IOTYPES[@type]}sock IO thread stopping (#{@main_io}, #{@fd})"
+      STDERR.puts "#{@fileno}: #{IOTYPES[@type]}sock IO thread stopping (#{@main_io}, #{@fd})"
       @io.close rescue nil
     end
   end
@@ -310,7 +406,7 @@ class VTHClientConnection
   end
 
   def end_client
-    @@clients[@io.fileno].each{|s| s.close rescue nil }
+    @@clients[@fileno].each{|s| s.close rescue nil }
     @io.close
   end
 
@@ -325,7 +421,7 @@ class VTHClientConnection
         @io.write "0\0"
         exit 0
       else
-        STDERR.puts "#{@io.fileno}: Unknown command"
+        STDERR.puts "#{@fileno}: Unknown command"
         @server.puts "Unknown command."
         @io.write "255\0"
       end
@@ -335,25 +431,25 @@ class VTHClientConnection
   end
 
   def do_spawn
-    STDERR.puts "#{@io.fileno}: Starting server for #{@args.inspect}"
+    STDERR.puts "#{@fileno}: Starting server for #{@args.inspect}"
     @server = VTHServer.new *@args
-    STDERR.puts "#{@io.fileno}: Set up server #{@server.inspect}"
+    STDERR.puts "#{@fileno}: Set up server #{@server.inspect}"
     connectsocks
     waitserver
   end
 
   def mkvterm
-    STDERR.puts "#{@io.fileno}: Getting server connection for #{@args.inspect}"
+    STDERR.puts "#{@fileno}: Getting server connection for #{@args.inspect}"
     @machine, @lpar = find_machine_arg *@args
-    STDERR.puts "#{@io.fileno}: Found machine #{machine.inspect}"
+    STDERR.puts "#{@fileno}: Found machine #{machine.inspect}"
     @server = get_server
-    STDERR.puts "#{@io.fileno}: Found server #{@server.inspect}"
+    STDERR.puts "#{@fileno}: Found server #{@server.inspect}"
     connectsocks
     waitserver
   end
 
   def connectsocks
-    @io.write "#{@io.fileno}\0"
+    @io.write "#{@fileno}\0"
     @io.write "#{@server.fds.join("\0")}\0"
     @io.getc
     @io.getc
@@ -363,16 +459,16 @@ class VTHClientConnection
 
   def waitserver
     begin
-      STDERR.puts "#{@io.fileno}: Starting server #{@server.cmd.inspect}"
+      STDERR.puts "#{@fileno}: Starting server #{@server.cmd.inspect}"
       @server.run
-      STDERR.puts "#{@io.fileno}: Waiting for #{@server.pid}"
-      status = @server.wait
+      STDERR.puts "#{@fileno}: Waiting for #{@server.pid}"
+      status = @server.wait_cmd
       @io.write "#{status}\0"
     ensure
-      STDERR.puts "#{@io.fileno}: #{@server.pid} exited, cleaning up"
+      STDERR.puts "#{@fileno}: #{@server.pid} exited, cleaning up"
       @server.cleanup
       remove_server @server unless @server.running
-      STDERR.puts "#{@io.fileno}: Terminating"
+      STDERR.puts "#{@fileno}: Terminating"
       @io.close
     end
   end
@@ -471,19 +567,20 @@ class VTHClient
       connectsock
     rescue
       STDERR.puts "Connecting to server failed, trying to fork one"
-      if ! @connected then if not fork then
-        STDERR.puts "Forked daemon"
-        VTHServerDispatcher.new
-      else
-        STDERR << "Waiting for sockserver to start"
-        (1..3).each{
-          connectsock rescue nil
-          break if @sock
-          sleep 1
-          STDERR << "."
-        }
-        STDERR << "\n"
-      end
+      if ! @connected then
+        if not fork then
+          STDERR.puts "Forked daemon"
+          VTHServerDispatcher.new
+        else
+          STDERR << "Waiting for sockserver to start"
+          (1..3).each{
+            connectsock rescue nil
+            break if @sock
+            sleep 1
+            STDERR << "."
+          }
+          STDERR << "\n"
+        end
       end
     end
     raise HydraConnectError.new  unless @sock

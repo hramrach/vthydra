@@ -26,6 +26,7 @@ Source1:        vthydra.conf
 # expect is fake dependency for the script that uses this package
 Requires:       expect
 Requires:       ruby
+Requires:       rubygem(ffi)
 
 %description
 HMC VT multiplesex
