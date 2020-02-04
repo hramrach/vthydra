@@ -1,4 +1,9 @@
 -------------------------------------------------------------------
+Tue Feb 25 16:31:58 UTC 2020 - Michal Suchanek <msuchanek@suse.de>
+
+- Improve synchronization using poll()
+
+-------------------------------------------------------------------
 Thu Jan 23 13:45:39 UTC 2020 - Michal Suchanek <msuchanek@suse.com>
 
 - Improve synchronization to capture output of shortlived processes.

@@ -16,96 +16,6 @@ class Array
   end
 end
 
-class IO
-  module Poll
-    arch, os = RUBY_PLATFORM.split('-')
-    case os
-    when /^linux$/
-=begin /usr/include/sys/poll.h
-typedef unsigned long int nfds_t;
-struct pollfd
-  {
-    int fd;                     /* File descriptor to poll.  */
-    short int events;           /* Types of events poller cares about.  */
-    short int revents;          /* Types of events that actually occurred.  */
-  };
-extern int poll (struct pollfd *__fds, nfds_t __nfds, int __timeout);
-=end
-      require 'ffi'
-      extend FFI::Library
-      ffi_lib FFI::Library::LIBC
-
-      class StructPollfd < FFI::Struct
-        layout :fd, :int,
-          :events, :short,
-          :revents, :short
-      end
-      attach_function 'poll', [:pointer, :int, :int], :int
-
-=begin /usr/include/bits/poll.h
-=end
-      POLLIN            = 0x0001        # There is data to read.
-      POLLPRI           = 0x0002        # There is urgent data to read.
-      POLLOUT           = 0x0004        # Writing now will not block.
-
-      # XOPEN
-      POLLRDNORM        = 0x0042        # Normal data may be read.
-      POLLRDBAND        = 0x0080        # Priority data may be read.
-      POLLWRNORM        = 0x0100        # Writing now will not block.
-      POLLWRBAND        = 0x0200        # Priority data may be written.
-
-      # GNU
-      POLLMSG           = 0x0400
-      POLLREMOVE        = 0x1000
-      POLLRDHUP         = 0x2000
-
-      # in revents only
-      POLLERR           = 0x0008        # Error condition.
-      POLLHUP           = 0x0010        # Hung up.
-      POLLNVAL          = 0x0020        # Invalid polling request.
-
-    else
-      raise "Platform #{RUBY_PLATFORM} not supported. Please check your poll.h and add definitions."
-    end
-  end
-  def self.select_with_poll read, write=[], error=[], timeout=nil
-    fds={}
-    error.each{|fd| fds[fd.fileno] = 0}
-    write.each{|fd| fds[fd.fileno] = Poll::POLLOUT }
-    read.each{|fd| fds[fd.fileno] ? (fds[fd.fileno] |= Poll::POLLIN) : fds[fd.fileno] = Poll::POLLIN }
-    pollfds = FFI::MemoryPointer.new(Poll::StructPollfd, fds.length)
-    fds.keys.each_with_index{|fd, i|
-      struct = Poll::StructPollfd.new(pollfds[i])
-      struct[:fd] = fd
-      struct[:events] = fds[fd]
-    }
-    FFI::LastError::error = 0
-    rc = Poll.poll pollfds, fds.length, (timeout ? timeout * 1000 : -1)
-    if (rc < 0) then
-      err = FFI::LastError::error
-      Errno.constants.each{|c|
-        throw Errno.const_get c if (Errno.const_get c)::Errno == err
-      }
-      throw "poll: Unknown error #{err}."
-    else
-      e = []
-      r = []
-      w = []
-      fdsi = fds.keys.map.with_index.to_h{|fd, i| [i, fd]}
-      error.each{|fd|
-        e << fd if (Poll::StructPollfd.new(pollfds[fdsi[fd.fileno]])[:revents] & (Poll::POLLERR | Poll::POLLHUP | Poll::POLLNVAL)) != 0
-      }
-      write.each{|fd|
-        w << fd if (Poll::StructPollfd.new(pollfds[fdsi[fd.fileno]])[:revents] & Poll::POLLOUT ) != 0
-      }
-      read.each{|fd|
-        r << fd if (Poll::StructPollfd.new(pollfds[fdsi[fd.fileno]])[:revents] & Poll::POLLIN ) != 0
-      }
-      return [r, w, e]
-    end
-  end
-end
-
 class VTHydraException < Exception
 end
 
@@ -193,7 +103,7 @@ class IODesc
       readerr = nil
       while true do
         begin
-          r, w, e = IO.select_with_poll [other.io], (buffer[0] ? [@io] : []) , [other.io,@io], 1
+          r, w, _, e = IO.select_with_poll [other.io], (buffer[0] ? [@io] : []) , [], [other.io,@io]
           STDERR.puts "Select #{stream_desc} b:#{buffer.inspect} r:#{r.inspect} w:#{w.inspect} e:#{e.inspect}"
         rescue Errno::EBADF
           fd = @io.fileno rescue nil

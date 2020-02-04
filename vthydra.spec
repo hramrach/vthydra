@@ -26,10 +26,11 @@ Source1:        vthydra.conf
 # expect is fake dependency for the script that uses this package
 Requires:       expect
 Requires:       ruby
-Requires:       rubygem(ffi)
+Requires:       ruby-poll
+BuildArch:      noarch
 
 %description
-HMC VT multiplesex
+HMC VT multiplexer
 
 %prep
 cp -a %{SOURCE2} %{SOURCE1} %{SOURCE0} . ||:
@@ -46,6 +47,7 @@ mkdir -p %{buildroot}/opt/hsc
 ln -s %{_bindir} %{buildroot}/opt/hsc/bin
 
 %post
+
 %postun
 
 %files
