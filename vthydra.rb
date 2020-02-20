@@ -110,26 +110,7 @@ class IODesc
           raise HydraPipeError.new "#{desc}: #{$!.message}" if ! fd
           readerr = $!
         end
-        e.each{|io|
-          if @io == io then
-            raise HydraPipeError.new "#{desc}: Poll error on descriptor"
-          else
-            raise HydraPipeError.new "#{other.desc}: Poll error on descriptor"
-          end
-        }
         begin
-          if r && r[0] then
-            data = r[0].read_nonblock BLOCKSIZE
-            if data then
-              STDERR.puts "Read from #{other.desc} (#{other.fileno}) '#{data}'"
-              buffer.push data
-            end
-          end
-        rescue Errno::ECONNRESET, EOFError, IOError, Errno::EPIPE, Errno::EBADF
-          readerr = $!
-        end
-        begin
-          @io.write ""
           while buffer[0] do
             data = buffer.shift
             written = @io.write_nonblock data
@@ -140,10 +121,30 @@ class IODesc
             end
             break if ! buffer[0]
           end
-        rescue Errno::ECONNRESET, EOFError, IOError, Errno::EPIPE, Errno::EBADF
-          raise HydraPipeError.new "#{desc}: #{$!.message}"
+        rescue Errno::ECONNRESET, EOFError, IOError, Errno::EPIPE, Errno::EBADF, IO::EAGAINWaitWritable
+          raise HydraPipeError.new "#{desc}: #{$!.message}" unless $!.is_a? IO::EAGAINWaitWritable
         end
-        raise HydraPipeError.new "#{other.desc}: #{readerr.message}" if readerr
+        begin
+          if r && r[0] then
+            data = r[0].read_nonblock BLOCKSIZE
+            if data then
+              STDERR.puts "Read from #{other.desc} (#{other.fileno}) '#{data}'"
+              buffer.push data
+            end
+          end
+        rescue Errno::ECONNRESET, EOFError, IOError, Errno::EPIPE, Errno::EBADF, IO::EAGAINWaitReadable
+          readerr = $! unless $!.is_a? IO::EAGAINWaitReadable
+        end
+        raise HydraPipeError.new "#{other.desc}: #{readerr.message}" if readerr && !buffer[0]
+        if !buffer[0] && (!r || !r[0]) then
+          e.each{|io|
+            if @io == io then
+              raise HydraPipeError.new "#{desc}: Poll error on descriptor"
+            else
+              raise HydraPipeError.new "#{other.desc}: Poll error on descriptor"
+            end
+          }
+        end
       end
     ensure
       STDERR.puts "Closing iothread " + stream_desc
