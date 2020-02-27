@@ -89,6 +89,13 @@ class IODesc
     other.stream_from self
   end
 
+  ABBR_LEN = 5
+
+  def shorten str
+    return str if str.length <= ABBR_LEN*2
+    str[0...ABBR_LEN] + "..." + str[-ABBR_LEN..-1]
+  end
+
   def cleanup
     return unless @close_finnished
     STDERR.puts "Cleaning up io #@desc (#{fileno})"
@@ -104,7 +111,7 @@ class IODesc
       while true do
         begin
           r, w, _, e = IO.select_with_poll [other.io], (buffer[0] ? [@io] : []) , [], [other.io,@io]
-          STDERR.puts "Select #{stream_desc} b:#{buffer.inspect} r:#{r.inspect} w:#{w.inspect} e:#{e.inspect}"
+          STDERR.puts "Select #{stream_desc} b:#{buffer.mapm(:length).inspect} r:#{r.inspect} w:#{w.inspect} e:#{e.inspect}"
         rescue Errno::EBADF
           fd = @io.fileno rescue nil
           raise HydraPipeError.new "#{desc}: #{$!.message}" if ! fd
@@ -114,7 +121,7 @@ class IODesc
           while buffer[0] do
             data = buffer.shift
             written = @io.write_nonblock data
-            STDERR.puts "Written to #{@desc} (#{fileno}) '#{data[0...written]}'"
+            STDERR.puts "Written to #{@desc} (#{fileno}) '#{shorten data[0...written]}'"
             if written < data.length then
               buffer.unshift data[written..-1]
               break
@@ -128,7 +135,7 @@ class IODesc
           if r && r[0] then
             data = r[0].read_nonblock BLOCKSIZE
             if data then
-              STDERR.puts "Read from #{other.desc} (#{other.fileno}) '#{data}'"
+              STDERR.puts "Read from #{other.desc} (#{other.fileno}) '#{shorten data}'"
               buffer.push data
             end
           end
