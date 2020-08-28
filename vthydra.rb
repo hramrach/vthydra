@@ -211,6 +211,7 @@ class VTHServer
   end
   def puts *args
     @stdout.puts *args
+    @stdout.flush
   end
   def running
     !@finished
@@ -368,9 +369,11 @@ class VTHClientConnection
         STDERR.puts "#{@cookie}: Killing server."
         @server.puts "Killing server."
         @io.write "0\0"
-        exit 0
+        # Something bogus here - the messages tends to get lost
+        sleep 0.1
+        Process.exit 0
       else
-        STDERR.puts "#{@cookie}: Unknown command."
+        STDERR.puts "#{@cookie}: Unknown command '#{a}'."
         @server.puts "Unknown command."
         @io.write "255\0"
       end
@@ -521,10 +524,10 @@ class VTHClient
           VTHServerDispatcher.new
         else
           STDERR << "Waiting for sockserver to start"
-          (1..3).each{
+          (1..10).each{
             connectsock rescue nil
             break if @sock
-            sleep 1
+            sleep 0.1
             STDERR << "."
           }
           STDERR << "\n"
