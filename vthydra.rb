@@ -164,6 +164,7 @@ end
 class VTHServer
   attr_accessor :persistent
   attr_reader :pid, :cmd
+
   def initialize *cmd
     @cmd = cmd
     @clients = []
@@ -179,9 +180,12 @@ class VTHServer
   end
   def run
     return if !@cmd || @cmd.length == 0
-    STDERR.puts "Starting server thread #{@cmd.inspect}"
     begin
-      @pid = spawn(*@cmd, :err=>@stderr, :out=>@stdout, :in=>@stdin, :close_others=>true)
+      @status_mutex.synchronize {
+        return if @pid
+        STDERR.puts "Starting server thread #{@cmd.inspect}"
+        @pid = spawn(*@cmd, :err=>@stderr, :out=>@stdout, :in=>@stdin, :close_others=>true)
+      }
       [@stdin, @stdout, @stderr].each{|fd| fd.close}
       Thread.new{
         begin
@@ -203,7 +207,7 @@ class VTHServer
     end
   end
   def fds
-    [@inpipe, @outpipe, @errpipe].mapm :to_i
+    [@inpipe, @outpipe, @errpipe]
   end
   def puts *args
     @stdout.puts *args
@@ -226,6 +230,7 @@ class VTHServer
     @status_mutex.synchronize {
       return @status if @status
       Process.waitpid @pid, 0 rescue nil
+      @pid = nil
       @status = $?
       @finished = true
       @status
@@ -234,8 +239,34 @@ class VTHServer
 end
 
 class VTHClientConnection
+  @@cookie_mutex = Mutex.new
+  @@cookies = {}
+
+  attr_accessor :cookie
+  def get_cookie
+    return @cookie if @cookie
+    cookie = Random.rand(1 << 30)
+    @@cookie_mutex.synchronize {
+      while @@cookies.keys.include? cookie do
+        cookie = Random.rand(1 << 30)
+      end
+      @cookie = cookie
+      @@cookies[cookie] = self
+    }
+    cookie
+  end
+  def self.lookup_cookie cookie
+    @@cookies[cookie]
+  end
+  def remove_cookie
+    @@cookie_mutex.synchronize {
+      @@cookies[@cookie] = nil if @cookie
+      @cookie = nil
+    }
+  end
+
   @@servers = {}
-  @@clients = {}
+  attr_accessor :server
 
   def readargs
     begin
@@ -251,16 +282,16 @@ class VTHClientConnection
     @fileno = io.fileno
     args = readargs
     if not args then
-      STDERR.puts "#{@fileno}: did not get arguments, closing."
+      STDERR.puts "Did not get arguments, closing."
       @io.close
     end
-    STDERR.puts "#{@fileno}: got arguments #{args.inspect}"
+    get_cookie
+    STDERR.puts "#{@cookie}: Got arguments #{args.inspect}"
     @command, *@args = args
     if @command =~ /^(in|out|err)sock$/ then
       @command.sub!(/sock$/,'')
       return sock
     end
-    @@clients[@fileno] = []
     return mkvterm if @command =~ /^mkvterm$/
     return do_spawn if @command =~ /^spawn$/
     @args = args
@@ -269,30 +300,28 @@ class VTHClientConnection
 
   def sock
     begin
-      @type =  IOTYPES.find_index(@command)
-      @main_io, @fd = @args.mapm :to_i
-      STDERR.puts "#{@fileno}: #{IOTYPES[@type]}sock IO thread starting (#{@main_io}, #{@fd})"
-      if @fd != 0 then
-        @pipe = IO.for_fd @fd rescue nil
-        pipedesc = "pipe:#{@fd}"
-        if @pipe then
-          @pipe = IODesc.new @pipe, pipedesc, true
-        else
-          raise HydraPipeError.new "#{pipedesc}: Bad file descriptor"
-        end
+      @type = IOTYPES.find_index(@command)
+      @main = @args[0].to_i
+      @cli = self.class.lookup_cookie @main
+      raise HydraPipeError.new "#{@cookie}: #{@main}: No such process" unless @cli
+      STDERR.puts "#{@cookie}: #{IOTYPES[@type]}sock IO thread starting (#{@main}, #{@type})"
+      pipedesc = "pipe:#{@main}#{@command}"
+      @pipe = @cli.server.fds[@type]
+      if @pipe then
+        @pipe = IODesc.new @pipe, pipedesc, true
+      else
+        raise HydraPipeError.new "#{pipedesc}: Bad file descriptor"
       end
-    end
-    @@clients[@main_io][@type] = @io
-    @io.write("\0");
-    @desc = IODesc.new @io, "#{IOTYPES[@type]}sock (#{@main_io}, #{@fd})", true
-    if @type > 0 then
-      @desc.stream_from @pipe
-    else
-      @desc.stream_to @pipe
-    end
-  ensure
-    if @fd !=0 then
-      STDERR.puts "#{@fileno}: #{IOTYPES[@type]}sock IO thread stopping (#{@main_io}, #{@fd})"
+      @io.write("\0");
+      @desc = IODesc.new @io, "#{IOTYPES[@type]}sock (#{@main}, #{@type})", true
+      if @type > 0 then
+        @desc.stream_from @pipe
+      else
+        @desc.stream_to @pipe
+      end
+    ensure
+      STDERR.puts "#{@cookie}: #{IOTYPES[@type]}sock IO thread stopping (#{@main}, #{@type})"
+      end_client
       @io.close rescue nil
     end
   end
@@ -321,25 +350,27 @@ class VTHClientConnection
 
   def remove_server server
     @@servers.delete_if{|k,s| s == server} if server
+    server.cleanup if server
   end
 
   def end_client
-    @@clients[@fileno].each{|s| s.close rescue nil }
+    remove_cookie
     @io.close
   end
 
   def servercmd
     @server = VTHServer.new
+    STDERR.puts "#{@cookie}: Starting server command #{@args.inspect}"
     connectsocks
     @args.each{|a|
       case a
       when /^Kill!$/
-        STDERR.puts "Killing server."
+        STDERR.puts "#{@cookie}: Killing server."
         @server.puts "Killing server."
         @io.write "0\0"
         exit 0
       else
-        STDERR.puts "#{@fileno}: Unknown command"
+        STDERR.puts "#{@cookie}: Unknown command."
         @server.puts "Unknown command."
         @io.write "255\0"
       end
@@ -349,26 +380,25 @@ class VTHClientConnection
   end
 
   def do_spawn
-    STDERR.puts "#{@fileno}: Starting server for #{@args.inspect}"
+    STDERR.puts "#{@cookie}: Starting server for #{@args.inspect}"
     @server = VTHServer.new *@args
-    STDERR.puts "#{@fileno}: Set up server #{@server.inspect}"
+    STDERR.puts "#{@cookie}: Set up server #{@server.inspect}"
     connectsocks
     waitserver
   end
 
   def mkvterm
-    STDERR.puts "#{@fileno}: Getting server connection for #{@args.inspect}"
+    STDERR.puts "#{@cookie} Getting server connection for #{@args.inspect}"
     @machine, @lpar = find_machine_arg *@args
-    STDERR.puts "#{@fileno}: Found machine #{machine.inspect}"
+    STDERR.puts "#{@cookie}: Found machine #{@machine.inspect} #{@lpar.inspect}"
     @server = get_server
-    STDERR.puts "#{@fileno}: Found server #{@server.inspect}"
+    STDERR.puts "#{@cookie} #{@lpar.inspect}: Found server #{@server.cookie} #{@server.inspect}"
     connectsocks
     waitserver
   end
 
   def connectsocks
-    @io.write "#{@fileno}\0"
-    @io.write "#{@server.fds.join("\0")}\0"
+    @io.write "#{get_cookie.to_s}\0"
     @io.getc
     @io.getc
     @io.getc
@@ -377,16 +407,17 @@ class VTHClientConnection
 
   def waitserver
     begin
-      STDERR.puts "#{@fileno}: Starting server #{@server.cmd.inspect}"
+      STDERR.puts "#{@cookie}: Starting server for #{@server.cmd.inspect}"
       @server.run
-      STDERR.puts "#{@fileno}: Waiting for #{@server.pid}"
+      STDERR.puts "#{@cookie}: Waiting for #{@server.pid}"
       status = @server.wait_cmd
       @io.write "#{status}\0"
     ensure
-      STDERR.puts "#{@fileno}: #{@server.pid} exited, cleaning up"
+      STDERR.puts "#{@cookie}: #{@server.pid} exited, cleaning up"
       @server.cleanup
       remove_server @server unless @server.running
-      STDERR.puts "#{@fileno}: Terminating"
+      STDERR.puts "#{@cookie}: Terminating"
+      end_client
       @io.close
     end
   end
@@ -445,16 +476,15 @@ class VTHClient
     @connected = true
     sock.write @args.join("\0")+"\0\0"
     @cli_key = readint sock
-    @sock_keys = (0..2).map{readint sock}
     @sock = sock
   end
 
-  def io_thread type, key
+  def io_thread type
     sock = newsock
-    sock.write "#{IOTYPES[type]}sock\0#@cli_key\0#{key}\0\0"
+    sock.write "#{IOTYPES[type]}sock\0#@cli_key\0\0"
     sock.getc
     stdio = IODesc.new IOS[type], "std#{IOTYPES[type]}"
-    desc = IODesc.new sock, "#{IOTYPES[type]}sock #@cli_key #{key}", true
+    desc = IODesc.new sock, "#{IOTYPES[type]}sock #@cli_key", true
     if type > 0 then
       sock.close_write
       method = :stream_from
@@ -474,7 +504,7 @@ class VTHClient
   end
 
   def passthru
-    threads=@sock_keys.to_enum(:each_with_index).map{|key,i| io_thread i, key}
+    threads=(0...3).map{|i| io_thread i}
     @sock.write("\0")
     threads.reverse.each{|t|t.join}
   end
